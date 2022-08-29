@@ -74,10 +74,15 @@ class TrainerConfig(Config):
             },
             defaults={
                 'autocast': True,
-                'clip_grad_norm': 1,
+                'clip_grad_norm': None,
+
+                'save_every': None,
+                'save_best': 'val_loss',
+
                 'optim': putils.AdamW,
                 'optim_grouper': putils.adamw_easy_grouper,
                 'optim_args': {'weight_decay': {'decay': 1e-3, 'no_decay': 0}},
+
                 'epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
                 'epoch_lr_scheduler_args': {'lr_lambda': 1},
                 'per_epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
@@ -94,15 +99,60 @@ class Trainer:
 
         self.epoch = 0
         self.step = 0
+        self.examples = 0
         self.epoch_step = 0
+
+        self.last_saved = self.step
+        self.best_score = None
 
         self.optim = self.gen_optim()
         self.epoch_lr = self.epoch_lr_scheduler()
         self.per_epoch_lr = self.per_epoch_lr_scheduler()
 
+    # RSI: pick up here:
+    # Separate load into resume and fine-tune
+    # Actually add tensorboard logic
+
+    def log_extra(self, batch_x, model_y, batch_y):
+        return {}
+
+    def tb_log(self, obj):
+        if val is False:
+            res = {'loss': loss, 'lr': self.per_epoch_lr.get_last_lr()}
+        else:
+            res = {'val_loss': loss}
+
+        return res
+
+    def save_all(self, path=None):
+        to_save = {}
+        for k, v in self.__dict__.items():
+            if callable(getattr(v, 'state_dict', None)):
+                to_save[k] = v.state_dict()
+            else:
+                to_save[k] = v
+
+        if path is None:
+            path = self.resume_path()
+        torch.save(to_save, path)
+
+    def load_all(self, path=None):
+        if path is None:
+            path = self.resume_path()
+        obj = torch.load(path)
+
+        for k, v in obj.items():
+            if callable(getattr(getattr(self, k), 'state_dict', None)):
+                getattr(self, k).load_state_dict(v)
+            else:
+                setattr(self, k, v)
+
     def gen_optim(self):
         c = self.config
-        params = putils.group_params(self.model, c.optim_grouper)
+        if c.optim_grouper is None:
+            params = {'': self.model.parameters()}
+        else:
+            params = putils.group_params(self.model, c.optim_grouper)
         split_opts = dict((k, {}) for k, v in params.items())
         all_opts = {}
         for arg, vals in c.optim_args:
@@ -150,10 +200,12 @@ class Trainer:
             loss = self.loss(model_y, batch_y)
             self.step += 1
             self.epoch_step += 1
+            self.examples += batch_x.shape[0]
 
-            to_log_default = {
+            res = {
                 'loss': loss,
                 'lr': self.per_epoch_lr.get_last_lr(),
+                **self.log_extra(batch_x, batch_y),
             }
             with torch.no_grad():
                 res = self.to_log(model_y, batch_y, to_log_default)
@@ -168,12 +220,11 @@ class Trainer:
             with torch.no_grad():
                 model_y = self.model(batch_x)
                 loss = self.loss(model_y, batch_y)
-                to_log_default = {
-                    'loss': loss,
-                    'lr': self.per_epoch_lr.get_last_lr(),
+                res = {
+                    'val_loss': loss,
+                    **self.log_extra(batch_x, model_y, batch_y),
                 }
-                return self.to_log(model_y, batch_y, to_log_default, val=True)
-
+                return res
 
     def train_one_epoch(self, validate=True):
         c = self.config
@@ -185,8 +236,17 @@ class Trainer:
             self.per_epoch_lr = self.per_epoch_lr_constructor(self.epoch)
 
             batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
-            to_log = self.train_one_step(batch_x, batch_y)
-            self.log(to_log)
+            to_log = self.train_one_step(batch_x, model_y, batch_y)
+            self.tb_log(to_log)
+
+            if c.save_every is not None and c.save_every < self.last_saved - self.step:
+                self.last_saved = self.step
+                self.save_all('step_chk')
+
+        self.epoch += 1
+        self.epoch_lr.step()
+
+        self.save_all('epoch_chk')
 
         if validate:
             self.model.train(False)
@@ -197,7 +257,11 @@ class Trainer:
                 for k, v in to_log.items():
                     acc = to_merge.setdefault(k, [])
                     acc.append(v)
-                self.log(dict((k, np.mean(v)) for k, v in to_merge.items()))
+                self.tb_log(dict((k, np.mean(v)) for k, v in to_merge.items()))
 
-        self.epoch += 1
-        self.epoch_lr.step()
+            if c.save_on_best is not None:
+                score = to_log[c.save_best]
+                if self.best_score is None or score < self.best_score:
+                    self.best_score = score
+                    self.save_all(f'best_{self.epoch:04d}')
+
