@@ -4,6 +4,7 @@ from tokenizers import Tokenizer, pre_tokenizers, decoders, processors
 from tokenizers.models import BPE
 
 from tokenizers.trainers import BpeTrainer
+from .config import Config
 
 import logging
 log = logging.getLogger(__name__)
@@ -62,11 +63,32 @@ class SaneBPE:
     def decode(self, x):
         return self.tokenizer.decode_batch(x)
 
-def default_lr_scheduler_constructor(optim, epoch):
-    return torch.optim.lr_scheduler.MultiplicativeLR(
-        optim, lr_lambda=1, last_epoch=epoch)
+class TrainerConfig(Config):
+    def __init__(self, obj, presets):
+        super().__init__(
+            obj,
+            presets,
+            required=[
+            ],
+            preset_map={
+            },
+            defaults={
+                'autocast': True,
+                'clip_grad_norm': 1,
+                'optim': putils.AdamW,
+                'optim_grouper': putils.adamw_easy_grouper,
+                'optim_args': {'weight_decay': {'decay': 1e-3, 'no_decay': 0}},
+                'epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
+                'epoch_lr_scheduler_args': {'lr_lambda': 1},
+                'per_epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
+                'per_epoch_lr_scheduler_args': {'lr_lambda': 1},
+            },
+        )
+
 class Trainer:
-    def __init__(self, per_epoch_lr_constructor=None, epoch_lr=None):
+    def __init__(self, model, config):
+        self.model = model
+        c = self.config = config
 
         self.scaler = torch.cuda.amp.GradScaler()
 
@@ -74,13 +96,34 @@ class Trainer:
         self.step = 0
         self.epoch_step = 0
 
+        self.optim = self.gen_optim()
+        self.epoch_lr = self.epoch_lr_scheduler()
+        self.per_epoch_lr = self.per_epoch_lr_scheduler()
 
-        if per_epoch_lr_constructor is None:
-            per_epoch_lr_constructor = default_lr_scheduler_constructor
-        self.per_epoch_lr = per_epoch_lr_constructor(self.optim, self.epoch)
-        if epoch_lr is None:
-            epoch_lr = default_lr_scheduler_constructor(self.optim, self.epoch)
-        self.epoch_lr = epoch_lr
+    def gen_optim(self):
+        c = self.config
+        params = putils.group_params(self.model, c.optim_grouper)
+        split_opts = dict((k, {}) for k, v in params.items())
+        all_opts = {}
+        for arg, vals in c.optim_args:
+            if isinstance(vals, dict):
+                for k, v in vals:
+                    if k in obj:
+                        split_opts[k][arg] = v
+            else:
+                all_opts[arg] = vals
+        split_params = [{'params': params[k], **split_opts[k]} for k in params]
+        return c.optim(split_params, **all_opts)
+
+    def per_epoch_lr_scheduler(self):
+        c = self.config.optim
+        return c.per_epoch_lr_scheduler(
+            self.optim, last_epoch=self.epoch-1, **c.per_epoch_lr_scheduler_args)
+
+    def epoch_lr_scheduler(self):
+        c = self.config
+        return c.epoch_lr_scheduler(
+            self.optim, last_epoch=self.epoch-1, **c.epoch_lr_scheduler_args)
 
     def backward(self, loss):
         c = self.config
