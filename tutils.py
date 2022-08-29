@@ -2,6 +2,7 @@ import os
 from datasets import load_dataset
 from tokenizers import Tokenizer, pre_tokenizers, decoders, processors
 from tokenizers.models import BPE
+from torch.utils.tensorboard import SummaryWriter
 
 from tokenizers.trainers import BpeTrainer
 from .config import Config
@@ -69,6 +70,7 @@ class TrainerConfig(Config):
             obj,
             presets,
             required=[
+                'run_name',
             ],
             preset_map={
             },
@@ -77,7 +79,12 @@ class TrainerConfig(Config):
                 'clip_grad_norm': None,
 
                 'save_every': None,
+                'save_on_epoch': True,
                 'save_best': 'val_loss',
+
+                'base_path': '.'
+                'checkpoint_path': 'checkpoints',
+                'tb_path': 'runs',
 
                 'optim': putils.AdamW,
                 'optim_grouper': putils.adamw_easy_grouper,
@@ -91,9 +98,13 @@ class TrainerConfig(Config):
         )
 
 class Trainer:
-    def __init__(self, model, config):
-        self.model = model
+    def __init__(self, config, model, loss):
         c = self.config = config
+        self.model = model
+        self.loss = loss
+
+        log.info(f'Configuring tensorboard at {self.canon_path(c.tb_path)}.')
+        self._writer = SummaryWriter(self.canon_path(c.tb_path))
 
         self.scaler = torch.cuda.amp.GradScaler()
 
@@ -109,24 +120,23 @@ class Trainer:
         self.epoch_lr = self.epoch_lr_scheduler()
         self.per_epoch_lr = self.per_epoch_lr_scheduler()
 
-    # RSI: pick up here:
-    # Separate load into resume and fine-tune
-    # Actually add tensorboard logic
-
     def log_extra(self, batch_x, model_y, batch_y):
         return {}
 
     def tb_log(self, obj):
-        if val is False:
-            res = {'loss': loss, 'lr': self.per_epoch_lr.get_last_lr()}
-        else:
-            res = {'val_loss': loss}
+        if self.c.tb_path is not None:
+            for k, v in obj.items():
+                self._writer.add_scalar(k, v, self.step)
 
-        return res
+    def canon_path(self, parts):
+        c = self.config
+        return os.path.join(c.base_path, c.name, **parts)
 
     def save_all(self, path=None):
         to_save = {}
         for k, v in self.__dict__.items():
+            if k[0] == '_':
+                continue
             if callable(getattr(v, 'state_dict', None)):
                 to_save[k] = v.state_dict()
             else:
@@ -134,18 +144,46 @@ class Trainer:
 
         if path is None:
             path = self.resume_path()
-        torch.save(to_save, path)
+        log.info(f'Saving to {self.canon_path(c.checkpoint_path, path)}.')
+        torch.save(to_save, self.canon_path(c.checkpoint_path, path))
 
-    def load_all(self, path=None):
-        if path is None:
-            path = self.resume_path()
-        obj = torch.load(path)
+    def load_all(self, path, only_keys=None):
+        log.info(f'Loading from {self.canon_path(c.checkpoint_path, path)}.')
+        obj = torch.load(self.canon_path(c.checkpoint_path, path))
 
         for k, v in obj.items():
+            if only_keys is not None and k not in only_keys:
+                continue
+            if k == 'config' and self.config is not None:
+                # TODO: maybe assert matching config
+                continue
+            log.info(f'  Setting {k}={v}.')
             if callable(getattr(getattr(self, k), 'state_dict', None)):
                 getattr(self, k).load_state_dict(v)
             else:
                 setattr(self, k, v)
+
+    def resume(self, path):
+        if path is None:
+            path = self.resume
+        log.info(f'Resuming.')
+        self.load_all(path=path)
+
+    def maybe_resume(self, path=None):
+        if path is None:
+            for candidate in ['epoch_chk.pt', 'step_chk.pt']:
+                p = self.canon_path(c.checkpoint_path, candidate)
+                if os.path.exists(p):
+                    path = p
+                    break
+        if path is None:
+            log.info(f'No checkpoint to resume from, training from scratch.')
+        else:
+            self.resume(path)
+
+    def fine_tune(self, path):
+        log.info(f'Fine tuning.')
+        self.load_all(path, only_keys=['model'])
 
     def gen_optim(self):
         c = self.config
@@ -226,10 +264,10 @@ class Trainer:
                 }
                 return res
 
-    def train_one_epoch(self, validate=True):
+    def train_one_epoch(self, train_data_iter, val_data_iter=None):
         c = self.config
-        train_data_iter, val_data_iter, _ = self.new_data_iters(c)
 
+        log.info('Training.')
         self.model.train(True)
         for _batch_x, _batch_y in train_data_iter:
             self.epoch_step = 0
@@ -241,14 +279,16 @@ class Trainer:
 
             if c.save_every is not None and c.save_every < self.last_saved - self.step:
                 self.last_saved = self.step
-                self.save_all('step_chk')
+                self.save_all('step_chk.pt')
 
         self.epoch += 1
         self.epoch_lr.step()
 
-        self.save_all('epoch_chk')
+        if c.save_on_epoch:
+            self.save_all('epoch_chk.pt')
 
-        if validate:
+        if val_data_iter is not None:
+            log.info('Validating.')
             self.model.train(False)
             to_merge = {}
             for _batch_x, _batch_y in val_data_iter:
@@ -259,9 +299,9 @@ class Trainer:
                     acc.append(v)
                 self.tb_log(dict((k, np.mean(v)) for k, v in to_merge.items()))
 
-            if c.save_on_best is not None:
+            if c.save_best is not None:
                 score = to_log[c.save_best]
                 if self.best_score is None or score < self.best_score:
                     self.best_score = score
-                    self.save_all(f'best_{self.epoch:04d}')
+                    self.save_all(f'best_{self.epoch:04d}.pt')
 
