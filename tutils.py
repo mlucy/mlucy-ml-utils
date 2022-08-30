@@ -109,10 +109,10 @@ class TrainerConfig(Config):
                 'optim_grouper': putils.adamw_easy_grouper,
                 'optim_args': {'weight_decay': {'decay': 1e-3, 'no_decay': 0}},
 
-                'epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR,
-                'epoch_lr_scheduler_args': {'lr_lambda': 1},
-                'per_epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR,
-                'per_epoch_lr_scheduler_args': {'lr_lambda': 1},
+                'epoch_lr_scheduler': torch.optim.lr_scheduler.ExponentialLR,
+                'epoch_lr_scheduler_args': {'gamma': 1},
+                'per_epoch_lr_scheduler': torch.optim.lr_scheduler.ExponentialLR,
+                'per_epoch_lr_scheduler_args': {'gamma': 1},
             },
         )
 
@@ -145,7 +145,8 @@ class Trainer:
         return {}
 
     def tb_log(self, obj):
-        if self.c.tb_path is not None:
+        c = self.config
+        if c.tb_path is not None:
             for k, v in obj.items():
                 self._writer.add_scalar(k, v, self.step)
 
@@ -224,6 +225,7 @@ class Trainer:
                         split_opts[k][arg] = v
             else:
                 all_opts[arg] = vals
+        self.param_group_names = list(params)
         split_params = [{'params': params[k], **split_opts[k]} for k in params]
         return c.optim(split_params, **all_opts)
 
@@ -264,11 +266,18 @@ class Trainer:
             self.epoch_step += 1
             self.examples += batch_x.shape[0]
 
+            print(f'LOSS: {loss}')
             res = {
                 'loss': loss,
-                'lr': self.per_epoch_lr.get_last_lr(),
                 **self.log_extra(batch_x, model_y, batch_y),
             }
+            lrs = self.per_epoch_lr.get_last_lr()
+            if len(lrs) == 1:
+                res['lr'] = lrs[0]
+            else:
+                assert len(lrs) == len(self.param_group_names)
+                for i in range(len(lrs)):
+                    res[f'lr_{self.param_group_names[i]}'] = lrs[i]
 
             self.backward(loss)
             self.per_epoch_lr.step()
@@ -297,7 +306,6 @@ class Trainer:
 
             batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
             to_log = self.train_one_step(batch_x, batch_y)
-            print(to_log)
             self.tb_log(to_log)
 
             if c.save_every is not None and c.save_every < self.last_saved - self.step:
