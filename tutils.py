@@ -3,9 +3,12 @@ from datasets import load_dataset
 from tokenizers import Tokenizer, pre_tokenizers, decoders, processors
 from tokenizers.models import BPE
 from torch.utils.tensorboard import SummaryWriter
+import torch
+from torch import nn
 
 from tokenizers.trainers import BpeTrainer
 from .config import Config
+from . import putils
 
 import logging
 log = logging.getLogger(__name__)
@@ -20,13 +23,14 @@ class SaneBPE:
         tokenizer.post_processor = processors.ByteLevel()
         self.tokenizer = tokenizer
 
-    def train_or_load(self, name, text_iter=None, n_tokens=10000, cache_path='/tmp'):
+    def train_or_load(self, name='default-wikipedia', text_iter=None,
+                      n_tokens=10000, cache_path='/tmp'):
         dname = os.path.join(cache_path, '_mlucy_utils')
         if not os.path.exists(dname):
             os.mkdir(dname)
         fname = os.path.join(dname, f'{name}.bpe-{VER}.json')
         if os.path.exists(fname):
-            self.tokenizer.load(fname)
+            self.tokenizer = self.tokenizer.from_file(fname)
             log.debug(f'SaneBPE: loaded from {fname}.')
             return
 
@@ -40,8 +44,8 @@ class SaneBPE:
             wikipedia = load_dataset('wikipedia', '20220301.en')
             def wiki_text_iter():
                 for i in range(1000):
-                    yield wikipedia
-            text_iter = wiki_text_iter
+                    yield wikipedia['train'][i]['text']
+            text_iter = wiki_text_iter()
         else:
             log.debug(f'SaneBPE: training on user text.')
         self.tokenizer.train_from_iterator(text_iter)
@@ -50,9 +54,23 @@ class SaneBPE:
         self.tokenizer.save(fname)
 
 
-    def _encode(self, x, output):
+    def _encode_batch(self, x, output):
         assert output in ['ids', 'tokens']
         res = self.tokenizer.encode_batch(x)
+        return [getattr(x, output) for x in res]
+
+    def encode_batch(self, x):
+        return self._encode_batch(x, 'ids')
+
+    def tokenize_batch(self, x):
+        return self._encode_batch(x, 'tokens')
+
+    def decode_batch(self, x):
+        return self.tokenizer.decode_batch(x)
+
+    def _encode(self, x, output):
+        assert output in ['ids', 'tokens']
+        res = self.tokenizer.encode(x)
         return [getattr(x, output) for x in res]
 
     def encode(self, x):
@@ -62,19 +80,20 @@ class SaneBPE:
         return self._encode(x, 'tokens')
 
     def decode(self, x):
-        return self.tokenizer.decode_batch(x)
+        return self.tokenizer.decode(x)
 
 class TrainerConfig(Config):
-    def __init__(self, obj, presets):
+    def __init__(self, **obj):
         super().__init__(
             obj,
-            presets,
+            presets=[],
             required=[
                 'run_name',
             ],
             preset_map={
             },
             defaults={
+                'device': 'cuda',
                 'autocast': True,
                 'clip_grad_norm': None,
 
@@ -82,17 +101,17 @@ class TrainerConfig(Config):
                 'save_on_epoch': True,
                 'save_best': 'val_loss',
 
-                'base_path': '.'
+                'base_path': '.',
                 'checkpoint_path': 'checkpoints',
                 'tb_path': 'runs',
 
-                'optim': putils.AdamW,
+                'optim': torch.optim.AdamW,
                 'optim_grouper': putils.adamw_easy_grouper,
                 'optim_args': {'weight_decay': {'decay': 1e-3, 'no_decay': 0}},
 
-                'epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
+                'epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR,
                 'epoch_lr_scheduler_args': {'lr_lambda': 1},
-                'per_epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR
+                'per_epoch_lr_scheduler': torch.optim.lr_scheduler.MultiplicativeLR,
                 'per_epoch_lr_scheduler_args': {'lr_lambda': 1},
             },
         )
@@ -101,10 +120,12 @@ class Trainer:
     def __init__(self, config, model, loss):
         c = self.config = config
         self.model = model
+        self.model.to(c.device)
         self.loss = loss
 
-        log.info(f'Configuring tensorboard at {self.canon_path(c.tb_path)}.')
-        self._writer = SummaryWriter(self.canon_path(c.tb_path))
+        writer_path = os.path.join(c.base_path, c.tb_path, c.run_name)
+        log.info(f'Configuring tensorboard at {writer_path}.')
+        self._writer = SummaryWriter(writer_path)
 
         self.scaler = torch.cuda.amp.GradScaler()
 
@@ -128,11 +149,12 @@ class Trainer:
             for k, v in obj.items():
                 self._writer.add_scalar(k, v, self.step)
 
-    def canon_path(self, parts):
+    def canon_path(self, *parts):
         c = self.config
-        return os.path.join(c.base_path, c.name, **parts)
+        return os.path.join(c.base_path, c.run_name, *parts)
 
     def save_all(self, path=None):
+        c = self.config
         to_save = {}
         for k, v in self.__dict__.items():
             if k[0] == '_':
@@ -148,6 +170,7 @@ class Trainer:
         torch.save(to_save, self.canon_path(c.checkpoint_path, path))
 
     def load_all(self, path, only_keys=None):
+        c = self.config
         log.info(f'Loading from {self.canon_path(c.checkpoint_path, path)}.')
         obj = torch.load(self.canon_path(c.checkpoint_path, path))
 
@@ -170,6 +193,7 @@ class Trainer:
         self.load_all(path=path)
 
     def maybe_resume(self, path=None):
+        c = self.config
         if path is None:
             for candidate in ['epoch_chk.pt', 'step_chk.pt']:
                 p = self.canon_path(c.checkpoint_path, candidate)
@@ -193,10 +217,10 @@ class Trainer:
             params = putils.group_params(self.model, c.optim_grouper)
         split_opts = dict((k, {}) for k, v in params.items())
         all_opts = {}
-        for arg, vals in c.optim_args:
+        for arg, vals in c.optim_args.items():
             if isinstance(vals, dict):
-                for k, v in vals:
-                    if k in obj:
+                for k, v in vals.items():
+                    if k in split_opts:
                         split_opts[k][arg] = v
             else:
                 all_opts[arg] = vals
@@ -204,7 +228,7 @@ class Trainer:
         return c.optim(split_params, **all_opts)
 
     def per_epoch_lr_scheduler(self):
-        c = self.config.optim
+        c = self.config
         return c.per_epoch_lr_scheduler(
             self.optim, last_epoch=self.epoch-1, **c.per_epoch_lr_scheduler_args)
 
@@ -271,7 +295,7 @@ class Trainer:
         self.model.train(True)
         for _batch_x, _batch_y in train_data_iter:
             self.epoch_step = 0
-            self.per_epoch_lr = self.per_epoch_lr_constructor(self.epoch)
+            self.per_epoch_lr = self.per_epoch_lr_scheduler()
 
             batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
             to_log = self.train_one_step(batch_x, model_y, batch_y)
