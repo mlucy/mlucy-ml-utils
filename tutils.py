@@ -48,7 +48,7 @@ class SaneBPE:
             text_iter = wiki_text_iter()
         else:
             log.debug(f'SaneBPE: training on user text.')
-        self.tokenizer.train_from_iterator(text_iter)
+        self.tokenizer.train_from_iterator(text_iter, trainer)
 
         log.debug(f'SaneBPE: saving to {fname}.')
         self.tokenizer.save(fname)
@@ -71,7 +71,7 @@ class SaneBPE:
     def _encode(self, x, output):
         assert output in ['ids', 'tokens']
         res = self.tokenizer.encode(x)
-        return [getattr(x, output) for x in res]
+        return getattr(res, output)
 
     def encode(self, x):
         return self._encode(x, 'ids')
@@ -241,7 +241,7 @@ class Trainer:
         c = self.config
         if c.autocast:
             self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
+            self.scaler.unscale_(self.optim)
         else:
             loss.backward()
 
@@ -267,10 +267,8 @@ class Trainer:
             res = {
                 'loss': loss,
                 'lr': self.per_epoch_lr.get_last_lr(),
-                **self.log_extra(batch_x, batch_y),
+                **self.log_extra(batch_x, model_y, batch_y),
             }
-            with torch.no_grad():
-                res = self.to_log(model_y, batch_y, to_log_default)
 
             self.backward(loss)
             self.per_epoch_lr.step()
@@ -298,7 +296,8 @@ class Trainer:
             self.per_epoch_lr = self.per_epoch_lr_scheduler()
 
             batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
-            to_log = self.train_one_step(batch_x, model_y, batch_y)
+            to_log = self.train_one_step(batch_x, batch_y)
+            print(to_log)
             self.tb_log(to_log)
 
             if c.save_every is not None and c.save_every < self.last_saved - self.step:
