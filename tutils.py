@@ -5,6 +5,7 @@ from tokenizers.models import BPE
 from torch.utils.tensorboard import SummaryWriter
 import torch
 from torch import nn
+import numpy as np
 
 from tokenizers.trainers import BpeTrainer
 from .config import Config
@@ -83,10 +84,10 @@ class SaneBPE:
         return self.tokenizer.decode(x)
 
 class TrainerConfig(Config):
-    def __init__(self, **obj):
+    def __init__(self, obj, presets=[]):
         super().__init__(
             obj,
-            presets=[],
+            presets=presets,
             required=[
                 'run_name',
             ],
@@ -123,7 +124,16 @@ class Trainer:
         self.model.to(c.device)
         self.loss = loss
 
-        writer_path = os.path.join(c.base_path, c.tb_path, c.run_name)
+        must_exist = [
+            c.base_path,
+            os.path.join(c.base_path, c.checkpoint_path),
+            self.canon_path(c.checkpoint_path),
+        ]
+        for path in must_exist:
+            if not os.path.exists(path):
+                os.mkdir(path)
+
+        writer_path = self.canon_path(c.tb_path)
         log.info(f'Configuring tensorboard at {writer_path}.')
         self._writer = SummaryWriter(writer_path)
 
@@ -150,11 +160,11 @@ class Trainer:
             for k, v in obj.items():
                 self._writer.add_scalar(k, v, self.step)
 
-    def canon_path(self, *parts):
+    def canon_path(self, typ, *parts):
         c = self.config
-        return os.path.join(c.base_path, c.run_name, *parts)
+        return os.path.join(c.base_path, typ, c.run_name, *parts)
 
-    def save_all(self, path=None):
+    def save_all(self, path):
         c = self.config
         to_save = {}
         for k, v in self.__dict__.items():
@@ -165,15 +175,17 @@ class Trainer:
             else:
                 to_save[k] = v
 
-        if path is None:
-            path = self.resume_path()
-        log.info(f'Saving to {self.canon_path(c.checkpoint_path, path)}.')
-        torch.save(to_save, self.canon_path(c.checkpoint_path, path))
+        log.info(f'Saving to {path}.')
+        torch.save(to_save, path)
+
+    def save_chk(self, path):
+        c = self.config
+        return self.save_all(self.canon_path(c.checkpoint_path, path))
 
     def load_all(self, path, only_keys=None):
         c = self.config
-        log.info(f'Loading from {self.canon_path(c.checkpoint_path, path)}.')
-        obj = torch.load(self.canon_path(c.checkpoint_path, path))
+        log.info(f'Loading from {path}.')
+        obj = torch.load(path)
 
         for k, v in obj.items():
             if only_keys is not None and k not in only_keys:
@@ -181,15 +193,14 @@ class Trainer:
             if k == 'config' and self.config is not None:
                 # TODO: maybe assert matching config
                 continue
-            log.info(f'  Setting {k}={v}.')
             if callable(getattr(getattr(self, k), 'state_dict', None)):
+                log.info(f'  Loading {k} from state_dict.')
                 getattr(self, k).load_state_dict(v)
             else:
+                log.info(f'  Setting {k}={v}.')
                 setattr(self, k, v)
 
     def resume(self, path):
-        if path is None:
-            path = self.resume
         log.info(f'Resuming.')
         self.load_all(path=path)
 
@@ -259,6 +270,7 @@ class Trainer:
 
     def train_one_step(self, batch_x, batch_y):
         c = self.config
+        self.optim.zero_grad()
         with torch.cuda.amp.autocast(enabled=c.autocast):
             model_y = self.model(batch_x)
             loss = self.loss(model_y, batch_y)
@@ -298,6 +310,24 @@ class Trainer:
     def train_one_epoch(self, train_data_iter, val_data_iter=None):
         c = self.config
 
+        if val_data_iter is not None:
+            log.info('Validating.')
+            self.model.train(False)
+            to_merge = {}
+            for _batch_x, _batch_y in val_data_iter:
+                batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
+                to_log = self.val_one_step(batch_x, batch_y)
+                for k, v in to_log.items():
+                    acc = to_merge.setdefault(k, [])
+                    acc.append(v.cpu())
+                self.tb_log(dict((k, np.mean(v)) for k, v in to_merge.items()))
+
+            if c.save_best is not None and self.epoch > 0:
+                score = to_log[c.save_best]
+                if self.best_score is None or score < self.best_score:
+                    self.best_score = score
+                    self.save_chk(f'best_{self.epoch:04d}.pt')
+
         log.info('Training.')
         self.model.train(True)
         for _batch_x, _batch_y in train_data_iter:
@@ -308,31 +338,48 @@ class Trainer:
             to_log = self.train_one_step(batch_x, batch_y)
             self.tb_log(to_log)
 
-            if c.save_every is not None and c.save_every < self.last_saved - self.step:
+            if c.save_every is not None and c.save_every < self.step - self.last_saved:
                 self.last_saved = self.step
-                self.save_all('step_chk.pt')
+                self.save_chk('step_chk.pt')
 
         self.epoch += 1
         self.epoch_lr.step()
 
         if c.save_on_epoch:
-            self.save_all('epoch_chk.pt')
+            self.save_chk('epoch_chk.pt')
 
-        if val_data_iter is not None:
-            log.info('Validating.')
-            self.model.train(False)
-            to_merge = {}
-            for _batch_x, _batch_y in val_data_iter:
-                batch_x, batch_y = _batch_x.to(c.device), _batch_y.to(c.device)
-                to_log = self.val_one_step(batch_x, batch_y)
-                for k, v in to_log.items():
-                    acc = to_merge.setdefault(k, [])
-                    acc.append(v)
-                self.tb_log(dict((k, np.mean(v)) for k, v in to_merge.items()))
 
-            if c.save_best is not None:
-                score = to_log[c.save_best]
-                if self.best_score is None or score < self.best_score:
-                    self.best_score = score
-                    self.save_all(f'best_{self.epoch:04d}.pt')
+def beam_search(width, dist, prefix, forward_log_probs, config):
+    c = config
+
+    cur_width = 1
+    state = torch.tile(prefix.unsqueeze(0), (cur_width, 1))
+    state = torch.cat((state, torch.zeros(cur_width, dist, dtype=torch.int32)), dim=1)
+    probs = torch.zeros(cur_width, 1)
+
+    for ctx_end in range(len(prefix), len(prefix)+dist):
+        ctx_start = max(0, ctx_end-c.length)
+        window_sz = ctx_end - ctx_start
+        assert window_sz > 0
+
+        batch = torch.cat((state[:, ctx_start:ctx_end],
+                           torch.zeros(cur_width, c.length - window_sz)), dim=1)
+        assert batch.shape == (cur_width, c.length)
+        all_log_probs = forward_log_probs(batch)
+        assert all_log_probs.shape == (cur_width, c.length, c.n_tokens)
+        next_log_probs = all_log_probs[:, ctx_end-ctx_start-1, :]
+        assert next_log_probs.shape == (cur_width, c.n_tokens)
+        adjusted_probs = next_log_probs + probs
+        line_probs = adjusted_probs.reshape(-1)
+        cur_width = min(width, len(line_probs))
+        new_best = torch.topk(line_probs, cur_width, sorted=True)
+
+        new_best_prefixes = new_best.indices.div(c.n_tokens, rounding_mode='floor')
+        new_best_idx = new_best.indices % c.n_tokens
+
+        state = state[new_best_prefixes]
+        state[:, ctx_end] = new_best_idx
+        probs = new_best.values.reshape(cur_width, 1)
+
+    return state, probs
 
