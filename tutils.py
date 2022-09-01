@@ -363,7 +363,9 @@ def beam_search(width, dist, prefix, forward_log_probs, config):
         assert window_sz > 0
 
         batch = torch.cat((state[:, ctx_start:ctx_end],
-                           torch.zeros(cur_width, c.length - window_sz)), dim=1)
+                           torch.zeros(cur_width, c.length - window_sz,
+                                       dtype=torch.int32)),
+                          dim=1)
         assert batch.shape == (cur_width, c.length)
         all_log_probs = forward_log_probs(batch)
         assert all_log_probs.shape == (cur_width, c.length, c.n_tokens)
