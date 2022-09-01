@@ -349,13 +349,14 @@ class Trainer:
             self.save_chk('epoch_chk.pt')
 
 
-def beam_search(width, dist, prefix, forward_log_probs, config):
+def beam_search(width, dist, prefix, forward_log_probs, config, temperature=1.0):
     c = config
+    sample_width = int(width**0.25)+1
 
     cur_width = 1
     state = torch.tile(prefix.unsqueeze(0), (cur_width, 1))
     state = torch.cat((state, torch.zeros(cur_width, dist, dtype=torch.int32)), dim=1)
-    probs = torch.zeros(cur_width, 1)
+    running_log_probs = torch.zeros(cur_width, 1)
 
     for ctx_end in range(len(prefix), len(prefix)+dist):
         ctx_start = max(0, ctx_end-c.length)
@@ -371,17 +372,24 @@ def beam_search(width, dist, prefix, forward_log_probs, config):
         assert all_log_probs.shape == (cur_width, c.length, c.n_tokens)
         next_log_probs = all_log_probs[:, ctx_end-ctx_start-1, :]
         assert next_log_probs.shape == (cur_width, c.n_tokens)
-        adjusted_probs = next_log_probs + probs
-        line_probs = adjusted_probs.reshape(-1)
-        cur_width = min(width, len(line_probs))
-        new_best = torch.topk(line_probs, cur_width, sorted=True)
 
-        new_best_prefixes = new_best.indices.div(c.n_tokens, rounding_mode='floor')
-        new_best_idx = new_best.indices % c.n_tokens
+        next_probs = torch.exp(next_log_probs)
+        heated_next_probs = next_probs / temperature
+        selected_idxs = torch.multinomial(
+            heated_next_probs, sample_width, replacement=False)
+
+        selected_log_probs = torch.gather(next_log_probs, 1, selected_idxs)
+        adjusted_log_probs = selected_log_probs + running_log_probs
+        line_log_probs = adjusted_log_probs.reshape(-1)
+        cur_width = min(width, len(line_log_probs))
+        new_best = torch.topk(line_log_probs, cur_width, sorted=True)
+
+        new_best_prefixes = new_best.indices.div(sample_width, rounding_mode='floor')
+        new_best_idx = selected_idxs.reshape(-1)[new_best.indices]
 
         state = state[new_best_prefixes]
         state[:, ctx_end] = new_best_idx
-        probs = new_best.values.reshape(cur_width, 1)
+        running_log_probs = new_best.values.reshape(cur_width, 1)
 
-    return state, probs
+    return state, running_log_probs
 
