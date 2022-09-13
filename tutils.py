@@ -25,7 +25,9 @@ class SaneBPE:
         self.tokenizer = tokenizer
 
     def train_or_load(self, name='default-wikipedia', text_iter=None,
-                      n_tokens=10000, cache_path='/tmp'):
+                      n_tokens=10000, n_docs=1000, cache_path='tokenizers'):
+        if not os.path.exists(cache_path):
+            os.mkdir(cache_path)
         dname = os.path.join(cache_path, '_mlucy_utils')
         if not os.path.exists(dname):
             os.mkdir(dname)
@@ -44,7 +46,7 @@ class SaneBPE:
             log.debug(f'SaneBPE: training on wikipedia.')
             wikipedia = load_dataset('wikipedia', '20220301.en')
             def wiki_text_iter():
-                for i in range(1000):
+                for i in range(n_docs):
                     yield wikipedia['train'][i]['text']
             text_iter = wiki_text_iter()
         else:
@@ -250,6 +252,9 @@ class Trainer:
         return c.epoch_lr_scheduler(
             self.optim, last_epoch=self.epoch-1, **c.epoch_lr_scheduler_args)
 
+    def gradient_callback(self):
+        pass
+
     def backward(self, loss):
         c = self.config
         if c.autocast:
@@ -261,6 +266,8 @@ class Trainer:
         if c.clip_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), c.clip_grad_norm)
+
+        self.gradient_callback()
 
         if c.autocast:
             self.scaler.step(self.optim)
@@ -349,7 +356,8 @@ class Trainer:
             self.save_chk('epoch_chk.pt')
 
 
-def beam_search(width, dist, prefix, forward_log_probs, config, temperature=1.0):
+def beam_search(width, dist, prefix, forward_log_probs, config, temperature=1.0,
+                forbidden_tokens=[], no_repeat_ngram_size=2):
     c = config
     sample_width = int(width**0.25)+1
 
@@ -372,6 +380,22 @@ def beam_search(width, dist, prefix, forward_log_probs, config, temperature=1.0)
         assert all_log_probs.shape == (cur_width, c.length, c.n_tokens)
         next_log_probs = all_log_probs[:, ctx_end-ctx_start-1, :]
         assert next_log_probs.shape == (cur_width, c.n_tokens)
+
+        for token in forbidden_tokens:
+            next_log_probs[:, token] = torch.tensor(-torch.inf)
+        # RSI: This is both slow and wrong.
+        if no_repeat_ngram_size > 0:
+            for i in range(cur_width):
+                forbidden = set([])
+                target_ngram = []
+                for f in range(ctx_end-(no_repeat_ngram_size-1), ctx_end):
+                    target_ngram.append(state[i][f])
+                target_ngram = torch.tensor(target_ngram)
+                for f in range(ctx_start, ctx_end):
+                    if all(state[i][f:f+no_repeat_ngram_size-1] == target_ngram):
+                        forbidden.add(state[i][f+no_repeat_ngram_size-1])
+                for token in forbidden:
+                    next_log_probs[i][token] = torch.tensor(-torch.inf)
 
         next_probs = torch.exp(next_log_probs)
         heated_next_probs = next_probs / temperature
